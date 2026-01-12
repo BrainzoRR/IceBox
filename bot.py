@@ -359,6 +359,8 @@ async def create_payment(user_id, amount, plan_type, description):
     """Create YooKassa payment"""
     payment_id = str(uuid.uuid4())
     
+    logger.info(f"Creating payment for user {user_id}: {amount}₽, plan={plan_type}")
+    
     async with aiohttp.ClientSession() as session:
         url = "https://api.yookassa.ru/v3/payments"
         
@@ -386,8 +388,14 @@ async def create_payment(user_id, amount, plan_type, description):
             }
         }
         
+        logger.info(f"Payment payload: {payload}")
+        
         try:
             async with session.post(url, json=payload, headers=headers, auth=auth) as response:
+                response_text = await response.text()
+                logger.info(f"YooKassa response status: {response.status}")
+                logger.info(f"YooKassa response body: {response_text}")
+                
                 if response.status == 200:
                     result = await response.json()
                     
@@ -400,12 +408,14 @@ async def create_payment(user_id, amount, plan_type, description):
                     conn.commit()
                     conn.close()
                     
+                    logger.info(f"Payment saved to DB: {result['id']}")
+                    
                     return result['confirmation']['confirmation_url'], result['id']
                 else:
-                    logger.error(f"YooKassa error: {response.status}")
+                    logger.error(f"YooKassa error: status={response.status}, body={response_text}")
                     return None, None
         except Exception as e:
-            logger.error(f"Payment creation error: {e}")
+            logger.error(f"Payment creation exception: {e}", exc_info=True)
             return None, None
 
 async def check_payment(payment_id):
@@ -521,6 +531,8 @@ async def cmd_premium(message: Message):
 async def process_payment(callback: CallbackQuery):
     plan = callback.data.split("_")[1]
     
+    logger.info(f"User {callback.from_user.id} selected plan: {plan}")
+    
     plans = {
         "month": (99, "30 дней", "month"),
         "year": (999, "1 год", "year"),
@@ -529,36 +541,46 @@ async def process_payment(callback: CallbackQuery):
     
     amount, period, plan_type = plans[plan]
     
-    # Создаём платёж
-    payment_url, payment_id = await create_payment(
-        callback.from_user.id,
-        amount,
-        plan_type,
-        f"IceBox Premium — {period}"
-    )
+    logger.info(f"Creating payment: amount={amount}, plan={plan_type}")
     
-    if payment_url:
-        # Показываем детали платежа
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить", url=payment_url)],
-            [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid_{payment_id}")]
-        ])
-        
-        await callback.message.edit_text(
-            f"💎 <b>Оформление Premium</b>\n\n"
-            f"📦 План: <b>{period}</b>\n"
-            f"💰 Сумма: <b>{amount}₽</b>\n\n"
-            f"1️⃣ Нажми <b>«💳 Оплатить»</b>\n"
-            f"2️⃣ Оплати любым способом (карта, СБП, ЮMoney)\n"
-            f"3️⃣ Вернись сюда и нажми <b>«✅ Я оплатил»</b>\n\n"
-            f"⏰ Ссылка действительна 1 час\n\n"
-            f"<i>ID платежа: <code>{payment_id}</code></i>",
-            reply_markup=kb,
-            parse_mode="HTML"
+    # Создаём платёж
+    try:
+        payment_url, payment_id = await create_payment(
+            callback.from_user.id,
+            amount,
+            plan_type,
+            f"IceBox Premium — {period}"
         )
-        await callback.answer()
-    else:
-        await callback.answer("❌ Ошибка создания платежа. Попробуй позже", show_alert=True)
+        
+        logger.info(f"Payment created: url={payment_url}, id={payment_id}")
+        
+        if payment_url:
+            # Показываем детали платежа
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💳 Оплатить", url=payment_url)],
+                [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid_{payment_id}")]
+            ])
+            
+            await callback.message.edit_text(
+                f"💎 <b>Оформление Premium</b>\n\n"
+                f"📦 План: <b>{period}</b>\n"
+                f"💰 Сумма: <b>{amount}₽</b>\n\n"
+                f"1️⃣ Нажми <b>«💳 Оплатить»</b>\n"
+                f"2️⃣ Оплати любым способом (карта, СБП, ЮMoney)\n"
+                f"3️⃣ Вернись сюда и нажми <b>«✅ Я оплатил»</b>\n\n"
+                f"⏰ Ссылка действительна 1 час\n\n"
+                f"<i>ID платежа: <code>{payment_id}</code></i>",
+                reply_markup=kb,
+                parse_mode="HTML"
+            )
+            await callback.answer()
+        else:
+            logger.error("Payment URL is None")
+            await callback.answer("❌ Ошибка создания платежа. Попробуй позже", show_alert=True)
+    
+    except Exception as e:
+        logger.error(f"Payment error: {e}", exc_info=True)
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
 
 @router.callback_query(F.data.startswith("paid_"))
 async def check_payment_status(callback: CallbackQuery):
@@ -1198,13 +1220,13 @@ async def handle_photo(message: Message):
 async def save_new_photo(callback: CallbackQuery):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT file_id, caption FROM temp_photos WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1", 
+    c.execute("SELECT file_id, caption, weather FROM temp_photos WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1", 
               (callback.from_user.id,))
     result = c.fetchone()
     
     if result:
-        file_id, caption = result
-        save_idea(callback.from_user.id, caption, "photo", file_id, source="direct")
+        file_id, caption, weather = result
+        save_idea(callback.from_user.id, caption, "photo", file_id, None, "direct", weather)
         c.execute("DELETE FROM temp_photos WHERE user_id = ?", (callback.from_user.id,))
         conn.commit()
         await callback.message.edit_text("🧊 Сохранено как новая идея")
@@ -1448,7 +1470,7 @@ async def handle_text(message: Message, state: FSMContext):
     # Skip commands and button presses
     if message.text.startswith("/") or message.text in [
         "🔓 Разморозить", "🔍 Поиск", "🗑️ Чистка", "❄️ Заморозка",
-        "📊 Статистика", "🔮 Эхо", "📦 Экспорт", "💎 Premium"
+        "📊 Статистика", "🔮 Эхо", "📦 Экспорт", "💎 Premium", "👤 Профиль"
     ]:
         return
     
@@ -1457,6 +1479,10 @@ async def handle_text(message: Message, state: FSMContext):
     if user[2] == 0 and user[4] >= FREE_LIMIT:
         await message.answer("⚠️ Достигнут лимит бесплатных идей (50)\n\n/premium — оформить подписку")
         return
+    
+    # Get weather
+    city = user[5]
+    weather = await get_weather(city) if city else None
     
     similar = check_similarity(message.from_user.id, message.text)
     if similar:
@@ -1472,8 +1498,8 @@ async def handle_text(message: Message, state: FSMContext):
         
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("CREATE TABLE IF NOT EXISTS temp_ideas (user_id INTEGER, content TEXT, timestamp TIMESTAMP)")
-        c.execute("INSERT INTO temp_ideas VALUES (?, ?, datetime('now'))", (message.from_user.id, message.text))
+        c.execute("CREATE TABLE IF NOT EXISTS temp_ideas (user_id INTEGER, content TEXT, weather TEXT, timestamp TIMESTAMP)")
+        c.execute("INSERT INTO temp_ideas VALUES (?, ?, ?, datetime('now'))", (message.from_user.id, message.text, weather))
         conn.commit()
         conn.close()
         
@@ -1483,19 +1509,20 @@ async def handle_text(message: Message, state: FSMContext):
         )
         return
     
-    save_idea(message.from_user.id, message.text, "text", source="direct")
+    save_idea(message.from_user.id, message.text, "text", None, None, "direct", weather)
     await message.answer("🧊")
 
 @router.callback_query(F.data == "save_new_text")
 async def save_new_text(callback: CallbackQuery):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT content FROM temp_ideas WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1", 
+    c.execute("SELECT content, weather FROM temp_ideas WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1", 
               (callback.from_user.id,))
     result = c.fetchone()
     
     if result:
-        save_idea(callback.from_user.id, result[0], "text", source="direct")
+        content, weather = result
+        save_idea(callback.from_user.id, content, "text", None, None, "direct", weather)
         c.execute("DELETE FROM temp_ideas WHERE user_id = ?", (callback.from_user.id,))
         conn.commit()
         await callback.message.edit_text("🧊 Сохранено как новая идея")
@@ -1511,4 +1538,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
