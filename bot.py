@@ -15,6 +15,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
+# ==================== CONFIG ====================
+from config import BOT_TOKEN, BOT_USERNAME, YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY, DB_PATH, FREE_LIMIT
+
 # ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,15 +30,8 @@ except ImportError:
     WHISPER_AVAILABLE = False
     logger.warning("Faster-Whisper not installed. Voice transcription disabled.")
 
-# ==================== CONFIG ====================
-TOKEN = "8432656805:AAE4y62n6xdcb3aXfWvPYGlm_C-jJDAbCOY"
-BOT_USERNAME = "IceBoxTbot"
-DB_PATH = "icebox.db"
-FREE_LIMIT = 50
-
-# YooKassa Config (вставь свои данные когда получишь)
-YOOKASSA_SHOP_ID = "YOUR_SHOP_ID"
-YOOKASSA_SECRET_KEY = "YOUR_SECRET_KEY"
+# ==================== BOT INITIALIZATION ====================
+bot = Bot(token=BOT_TOKEN)
 
 # Whisper model (faster-whisper, локально)
 WHISPER_MODEL = None  # Инициализируется при старте
@@ -1515,3 +1511,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
