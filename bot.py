@@ -15,9 +15,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-# ==================== CONFIG ====================
-from config import BOT_TOKEN, BOT_USERNAME, YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY, DB_PATH, FREE_LIMIT
-
 # ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,8 +27,15 @@ except ImportError:
     WHISPER_AVAILABLE = False
     logger.warning("Faster-Whisper not installed. Voice transcription disabled.")
 
-# ==================== BOT INITIALIZATION ====================
-bot = Bot(token=BOT_TOKEN)
+# ==================== CONFIG ====================
+TOKEN = "8432656805:AAE4y62n6xdcb3aXfWvPYGlm_C-jJDAbCOY"
+BOT_USERNAME = "IceBoxTbot"
+DB_PATH = "icebox.db"
+FREE_LIMIT = 50
+
+# YooKassa Config (вставь свои данные когда получишь)
+YOOKASSA_SHOP_ID = "YOUR_SHOP_ID"
+YOOKASSA_SECRET_KEY = "YOUR_SECRET_KEY"
 
 # Whisper model (faster-whisper, локально)
 WHISPER_MODEL = None  # Инициализируется при старте
@@ -443,7 +447,7 @@ def activate_premium(user_id, plan_type):
     conn.close()
 
 # ==================== BOT ====================
-bot = Bot(token=TOKEN)
+bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
@@ -476,31 +480,42 @@ async def cmd_premium(message: Message):
     
     if user[2] == 1:
         premium_until = datetime.fromisoformat(user[3]).strftime("%d.%m.%Y")
+        
+        # Сколько дней осталось
+        days_left = (datetime.fromisoformat(user[3]) - datetime.now()).days
+        
         await message.answer(
             f"✅ <b>У тебя активна подписка</b>\n\n"
-            f"Действует до: {premium_until}\n\n"
-            f"🎁 Доступно:\n"
-            f"• Безлимит идей\n"
-            f"• Транскрибация голосовых\n"
-            f"• Экспорт в Markdown\n"
-            f"• Долгие заморозки (до навсегда)",
+            f"📅 Действует до: <b>{premium_until}</b>\n"
+            f"⏰ Осталось: <b>{days_left} дней</b>\n\n"
+            f"🎁 <b>Доступно:</b>\n"
+            f"• ∞ Безлимит идей\n"
+            f"• 🎤 Транскрибация голосовых\n"
+            f"• 📦 Экспорт в Markdown\n"
+            f"• ❄️ Долгие заморозки (до 365 дней)\n"
+            f"• ⚙️ Кастомная заморозка\n\n"
+            f"Спасибо за поддержку! 💙",
             parse_mode="HTML"
         )
         return
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📅 30 дней — 99₽", callback_data="buy_month")],
-        [InlineKeyboardButton(text="🗓️ 1 год — 999₽", callback_data="buy_year")],
-        [InlineKeyboardButton(text="♾️ Навсегда — 1999₽", callback_data="buy_lifetime")]
+        [InlineKeyboardButton(text="🗓️ 1 год — 999₽ 🔥", callback_data="buy_year")],
+        [InlineKeyboardButton(text="♾️ Навсегда — 1999₽ ⭐", callback_data="buy_lifetime")]
     ])
     
     await message.answer(
         "💎 <b>IceBox Premium</b>\n\n"
-        "🎁 Что получаешь:\n"
-        "• Безлимит идей (без ограничения в 50)\n"
-        "• Автоматическая транскрибация голосовых сообщений\n"
-        "• Экспорт всех идей в Markdown\n"
-        "• Долгие заморозки (90 дней и навсегда)\n\n"
+        "🎁 <b>Что получаешь:</b>\n"
+        "• ∞ Безлимит идей (сейчас лимит 50)\n"
+        "• 🎤 Автоматическая транскрибация голоса\n"
+        "• 📦 Экспорт всех идей в Markdown\n"
+        "• ❄️ Долгие заморозки (90 дней и навсегда)\n"
+        "• ⚙️ Кастомная заморозка (от 1 до 365 дней)\n\n"
+        "💳 <b>Способы оплаты:</b>\n"
+        "Карты РФ, СБП, ЮMoney, Qiwi\n\n"
+        "🔒 Безопасная оплата через ЮKassa\n\n"
         "Выбери план:",
         reply_markup=kb,
         parse_mode="HTML"
@@ -518,6 +533,7 @@ async def process_payment(callback: CallbackQuery):
     
     amount, period, plan_type = plans[plan]
     
+    # Создаём платёж
     payment_url, payment_id = await create_payment(
         callback.from_user.id,
         amount,
@@ -526,26 +542,33 @@ async def process_payment(callback: CallbackQuery):
     )
     
     if payment_url:
+        # Показываем детали платежа
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Оплатить", url=payment_url)],
-            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check_{payment_id}")]
+            [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid_{payment_id}")]
         ])
         
         await callback.message.edit_text(
-            f"💳 <b>Оплата подписки</b>\n\n"
-            f"План: {period}\n"
-            f"Сумма: {amount}₽\n\n"
-            f"Нажми кнопку для оплаты.\n"
-            f"После оплаты нажми 'Проверить оплату'",
+            f"💎 <b>Оформление Premium</b>\n\n"
+            f"📦 План: <b>{period}</b>\n"
+            f"💰 Сумма: <b>{amount}₽</b>\n\n"
+            f"1️⃣ Нажми <b>«💳 Оплатить»</b>\n"
+            f"2️⃣ Оплати любым способом (карта, СБП, ЮMoney)\n"
+            f"3️⃣ Вернись сюда и нажми <b>«✅ Я оплатил»</b>\n\n"
+            f"⏰ Ссылка действительна 1 час\n\n"
+            f"<i>ID платежа: <code>{payment_id}</code></i>",
             reply_markup=kb,
             parse_mode="HTML"
         )
+        await callback.answer()
     else:
         await callback.answer("❌ Ошибка создания платежа. Попробуй позже", show_alert=True)
 
-@router.callback_query(F.data.startswith("check_"))
+@router.callback_query(F.data.startswith("paid_"))
 async def check_payment_status(callback: CallbackQuery):
     payment_id = callback.data.split("_", 1)[1]
+    
+    await callback.answer("⏳ Проверяю платёж...", show_alert=False)
     
     status = await check_payment(payment_id)
     
@@ -566,16 +589,36 @@ async def check_payment_status(callback: CallbackQuery):
             
             await callback.message.edit_text(
                 "✅ <b>Оплата успешна!</b>\n\n"
-                "Подписка активирована.\n"
-                "Теперь тебе доступны все премиум-функции!",
+                "🎉 Premium активирован!\n\n"
+                "Теперь тебе доступны:\n"
+                "• Безлимит идей\n"
+                "• Транскрибация голосовых\n"
+                "• Экспорт в Markdown\n"
+                "• Долгие заморозки\n\n"
+                "Спасибо за поддержку! 💙",
                 parse_mode="HTML"
             )
         
         conn.close()
     elif status == "pending" or status == "waiting_for_capture":
-        await callback.answer("⏳ Платёж ещё обрабатывается. Подожди немного", show_alert=True)
+        await callback.answer(
+            "⏳ Платёж ещё обрабатывается\n\n"
+            "Подожди 1-2 минуты и нажми снова",
+            show_alert=True
+        )
+    elif status == "canceled":
+        await callback.message.edit_text(
+            "❌ <b>Платёж отменён</b>\n\n"
+            "Попробуй оформить подписку заново:\n"
+            "/premium",
+            parse_mode="HTML"
+        )
     else:
-        await callback.answer("❌ Платёж не найден или отменён", show_alert=True)
+        await callback.answer(
+            "❌ Платёж не найден или отклонён\n\n"
+            "Если оплатил, подожди пару минут",
+            show_alert=True
+        )
 
 @router.message(Command("export"))
 async def cmd_export(message: Message):
