@@ -22,6 +22,11 @@ from config import BOT_TOKEN, BOT_USERNAME, YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KE
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Проверяем что все токены загружены
+logger.info(f"BOT_TOKEN: {'✓' if BOT_TOKEN else '✗'}")
+logger.info(f"YOOKASSA_SHOP_ID: {YOOKASSA_SHOP_ID if YOOKASSA_SHOP_ID else '✗ NOT SET'}")
+logger.info(f"YOOKASSA_SECRET_KEY: {'✓' if YOOKASSA_SECRET_KEY else '✗ NOT SET'}")
+
 # faster_whisper будет установлен позже
 try:
     from faster_whisper import WhisperModel
@@ -49,6 +54,8 @@ def init_db():
         premium_until TIMESTAMP,
         ideas_count INTEGER DEFAULT 0,
         city TEXT,
+        referral_code TEXT UNIQUE,
+        referred_by INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
     
@@ -91,6 +98,35 @@ def init_db():
         FOREIGN KEY (user_id) REFERENCES users (user_id)
     )''')
     
+    # Time capsules table
+    c.execute('''CREATE TABLE IF NOT EXISTS time_capsules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        message TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        open_at TIMESTAMP,
+        is_opened INTEGER DEFAULT 0,
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
+    )''')
+    
+    # Referrals table
+    c.execute('''CREATE TABLE IF NOT EXISTS referrals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        referrer_id INTEGER,
+        referred_id INTEGER UNIQUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        reward_given INTEGER DEFAULT 0,
+        FOREIGN KEY (referrer_id) REFERENCES users (user_id)
+    )''')
+    
+    # Daily stats table (for community stats)
+    c.execute('''CREATE TABLE IF NOT EXISTS daily_stats (
+        date TEXT PRIMARY KEY,
+        ideas_saved INTEGER DEFAULT 0,
+        night_ideas INTEGER DEFAULT 0,
+        users_active INTEGER DEFAULT 0
+    )''')
+    
     conn.commit()
     conn.close()
 
@@ -100,7 +136,9 @@ def get_user(user_id):
     c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     user = c.fetchone()
     if not user:
-        c.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
+        # Generate unique referral code
+        referral_code = f"ICE{user_id % 100000:05d}"
+        c.execute("INSERT INTO users (user_id, referral_code) VALUES (?, ?)", (user_id, referral_code))
         conn.commit()
         c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         user = c.fetchone()
@@ -138,8 +176,28 @@ def save_idea(user_id, content, idea_type, file_id=None, file_path=None, source=
     
     c.execute("UPDATE users SET ideas_count = ideas_count + 1 WHERE user_id = ?", (user_id,))
     
+    # Update daily stats
+    today = now.strftime("%Y-%m-%d")
+    is_night = now.hour >= 22 or now.hour < 6
+    
+    c.execute("INSERT OR IGNORE INTO daily_stats (date, ideas_saved, night_ideas, users_active) VALUES (?, 0, 0, 0)", (today,))
+    c.execute("UPDATE daily_stats SET ideas_saved = ideas_saved + 1 WHERE date = ?", (today,))
+    if is_night:
+        c.execute("UPDATE daily_stats SET night_ideas = night_ideas + 1 WHERE date = ?", (today,))
+    
+    # Check for achievement rewards
+    ideas_count = user[4] + 1
+    if ideas_count == 100 and user[2] == 0:  # 100 ideas milestone, not premium
+        # Give 7 days premium
+        premium_until = datetime.now() + timedelta(days=7)
+        c.execute("UPDATE users SET is_premium = 1, premium_until = ? WHERE user_id = ?", (premium_until, user_id))
+        conn.commit()
+        conn.close()
+        return "achievement_100"
+    
     conn.commit()
     conn.close()
+    return None
 
 def check_similarity(user_id, new_content):
     """Check if similar idea exists"""
@@ -252,6 +310,78 @@ def get_valuable_ideas_for_export(user_id):
     conn.close()
     return ideas
 
+# ==================== AI INSIGHTS ====================
+def get_ai_insights(user_id):
+    """Analyze user's ideas and generate insights"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Get all ideas
+    c.execute("SELECT content, day_of_week, time_of_day, created_at FROM ideas WHERE user_id = ?", (user_id,))
+    ideas = c.fetchall()
+    
+    if len(ideas) < 10:
+        conn.close()
+        return None
+    
+    # Analyze patterns
+    insights = {}
+    
+    # Time patterns
+    hour_counts = {}
+    day_counts = {}
+    for content, dow, tod, created_at in ideas:
+        if tod:
+            hour = int(tod.split(":")[0])
+            hour_counts[hour] = hour_counts.get(hour, 0) + 1
+        if dow:
+            day_counts[dow] = day_counts.get(dow, 0) + 1
+    
+    # Find peak time
+    if hour_counts:
+        peak_hour = max(hour_counts, key=hour_counts.get)
+        insights['peak_hour'] = peak_hour
+        insights['peak_hour_count'] = hour_counts[peak_hour]
+    
+    # Find peak day
+    if day_counts:
+        peak_day = max(day_counts, key=day_counts.get)
+        insights['peak_day'] = peak_day
+        insights['peak_day_count'] = day_counts[peak_day]
+    
+    # Average idea length
+    lengths = [len(c) for c, _, _, _ in ideas if c]
+    if lengths:
+        insights['avg_length'] = sum(lengths) // len(lengths)
+    
+    # Ideas this month
+    this_month = datetime.now().strftime("%Y-%m")
+    month_ideas = [i for i in ideas if i[3] and i[3].startswith(this_month)]
+    insights['this_month'] = len(month_ideas)
+    
+    # Survival rate
+    c.execute("SELECT ideas_count FROM users WHERE user_id = ?", (user_id,))
+    total = c.fetchone()[0]
+    insights['survival_rate'] = int((len(ideas) / max(total, 1)) * 100)
+    
+    conn.close()
+    return insights
+
+def get_community_stats():
+    """Get today's community statistics"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("SELECT ideas_saved, night_ideas FROM daily_stats WHERE date = ?", (today,))
+    result = c.fetchone()
+    
+    conn.close()
+    
+    if result:
+        return {"ideas_today": result[0], "night_ideas": result[1]}
+    return {"ideas_today": 0, "night_ideas": 0}
+
 # ==================== STATES ====================
 class SearchStates(StatesGroup):
     waiting_for_query = State()
@@ -262,6 +392,13 @@ class FreezeStates(StatesGroup):
 class ProfileStates(StatesGroup):
     waiting_for_city = State()
 
+class CapsuleStates(StatesGroup):
+    waiting_for_message = State()
+    waiting_for_duration = State()
+
+class ReferralStates(StatesGroup):
+    waiting_for_code = State()
+
 # ==================== KEYBOARD ====================
 def get_main_keyboard():
     """Главная клавиатура с командами"""
@@ -271,7 +408,7 @@ def get_main_keyboard():
             [KeyboardButton(text="🗑️ Чистка"), KeyboardButton(text="❄️ Заморозка")],
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🔮 Эхо")],
             [KeyboardButton(text="📦 Экспорт"), KeyboardButton(text="💎 Premium")],
-            [KeyboardButton(text="👤 Профиль")]
+            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="⏰ Капсула")]
         ],
         resize_keyboard=True
     )
@@ -453,14 +590,46 @@ def activate_premium(user_id, plan_type):
     conn.close()
 
 # ==================== BOT ====================
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    get_user(message.from_user.id)
+    user = get_user(message.from_user.id)
+    
+    # Check for referral code in start parameter
+    if len(message.text.split()) > 1:
+        ref_code = message.text.split()[1].upper()
+        
+        # If user doesn't have referrer yet
+        if not user[7]:  # referred_by field
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            
+            c.execute("SELECT user_id FROM users WHERE referral_code = ?", (ref_code,))
+            result = c.fetchone()
+            
+            if result and result[0] != message.from_user.id:
+                referrer_id = result[0]
+                
+                try:
+                    c.execute("INSERT INTO referrals (referrer_id, referred_id) VALUES (?, ?)",
+                              (referrer_id, message.from_user.id))
+                    c.execute("UPDATE users SET referred_by = ? WHERE user_id = ?",
+                              (referrer_id, message.from_user.id))
+                    conn.commit()
+                    
+                    await message.answer(
+                        "✅ Реферальный код активирован!\n\n"
+                        "Когда купишь Premium, твой друг получит +7 дней в подарок 🎁"
+                    )
+                except sqlite3.IntegrityError:
+                    pass
+            
+            conn.close()
+    
     await message.answer(
         "🧊 <b>IceBox</b> — холодильник для твоих идей\n\n"
         "Просто отправь идею — текст, голос, фото.\n"
@@ -472,9 +641,11 @@ async def cmd_start(message: Message):
         "/find — поиск по словам\n"
         "/stats — статистика\n"
         "/echo — случайная идея из прошлого\n"
+        "/capsule — капсула времени\n"
         "/export — экспорт в Markdown\n"
         "/premium — подписка\n"
         "/profile — твой профиль\n"
+        "/referral — пригласи друзей\n"
         "/givepremium — активировать Premium",
         parse_mode="HTML",
         reply_markup=get_main_keyboard()
@@ -490,6 +661,13 @@ async def cmd_premium(message: Message):
         # Сколько дней осталось
         days_left = (datetime.fromisoformat(user[3]) - datetime.now()).days
         
+        # Referral info
+        referral_code = user[6]
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎁 Пригласи друга", callback_data="show_referral")]
+        ])
+        
         await message.answer(
             f"✅ <b>У тебя активна подписка</b>\n\n"
             f"📅 Действует до: <b>{premium_until}</b>\n"
@@ -498,17 +676,21 @@ async def cmd_premium(message: Message):
             f"• ∞ Безлимит идей\n"
             f"• 🎤 Транскрибация голосовых\n"
             f"• 📦 Экспорт в Markdown\n"
+            f"• 🧠 AI-инсайты\n"
             f"• ❄️ Долгие заморозки (до 365 дней)\n"
             f"• ⚙️ Кастомная заморозка\n\n"
-            f"Спасибо за поддержку! 💙",
-            parse_mode="HTML"
+            f"💡 Пригласи друга и получи +7 дней!\n"
+            f"Твой код: <code>{referral_code}</code>",
+            parse_mode="HTML",
+            reply_markup=kb
         )
         return
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📅 30 дней — 99₽", callback_data="buy_month")],
         [InlineKeyboardButton(text="🗓️ 1 год — 999₽ 🔥", callback_data="buy_year")],
-        [InlineKeyboardButton(text="♾️ Навсегда — 1999₽ ⭐", callback_data="buy_lifetime")]
+        [InlineKeyboardButton(text="♾️ Навсегда — 1999₽ ⭐", callback_data="buy_lifetime")],
+        [InlineKeyboardButton(text="🎁 Ввести код друга", callback_data="enter_ref_code")]
     ])
     
     await message.answer(
@@ -517,12 +699,13 @@ async def cmd_premium(message: Message):
         "• ∞ Безлимит идей (сейчас лимит 50)\n"
         "• 🎤 Автоматическая транскрибация голоса\n"
         "• 📦 Экспорт всех идей в Markdown\n"
+        "• 🧠 AI-анализ твоего мышления\n"
         "• ❄️ Долгие заморозки (90 дней и навсегда)\n"
         "• ⚙️ Кастомная заморозка (от 1 до 365 дней)\n\n"
         "💳 <b>Способы оплаты:</b>\n"
         "Карты РФ, СБП, ЮMoney, Qiwi\n\n"
         "🔒 Безопасная оплата через ЮKassa\n\n"
-        "Выбери план:",
+        "💡 <b>Бонус:</b> Сохрани 100 идей → получи 7 дней Premium бесплатно!",
         reply_markup=kb,
         parse_mode="HTML"
     )
@@ -603,6 +786,41 @@ async def check_payment_status(callback: CallbackQuery):
             
             c.execute("UPDATE payments SET status = 'paid', paid_at = datetime('now') WHERE payment_id = ?",
                      (payment_id,))
+            
+            # Check for referrer and give bonus
+            c.execute("SELECT referred_by FROM users WHERE user_id = ?", (user_id,))
+            ref_result = c.fetchone()
+            
+            if ref_result and ref_result[0]:
+                referrer_id = ref_result[0]
+                
+                # Give referrer +7 days
+                c.execute("SELECT premium_until FROM users WHERE user_id = ?", (referrer_id,))
+                ref_premium = c.fetchone()
+                
+                if ref_premium and ref_premium[0]:
+                    current_until = datetime.fromisoformat(ref_premium[0])
+                    new_until = max(current_until, datetime.now()) + timedelta(days=7)
+                else:
+                    new_until = datetime.now() + timedelta(days=7)
+                
+                c.execute("UPDATE users SET is_premium = 1, premium_until = ? WHERE user_id = ?",
+                          (new_until, referrer_id))
+                c.execute("UPDATE referrals SET reward_given = 1 WHERE referrer_id = ? AND referred_id = ?",
+                          (referrer_id, user_id))
+                
+                # Notify referrer
+                try:
+                    await bot.send_message(
+                        referrer_id,
+                        "🎉 <b>Твой друг купил Premium!</b>\n\n"
+                        "Ты получил +7 дней Premium в подарок!\n"
+                        "Спасибо за то, что делишься IceBox 💙",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+            
             conn.commit()
             
             await callback.message.edit_text(
@@ -612,6 +830,7 @@ async def check_payment_status(callback: CallbackQuery):
                 "• Безлимит идей\n"
                 "• Транскрибация голосовых\n"
                 "• Экспорт в Markdown\n"
+                "• AI-инсайты\n"
                 "• Долгие заморозки\n\n"
                 "Спасибо за поддержку! 💙",
                 parse_mode="HTML"
@@ -948,16 +1167,33 @@ async def cmd_stats(message: Message):
         premium_until = datetime.fromisoformat(user[3]).strftime("%d.%m.%Y")
         premium_status = f"\n💎 Premium до: {premium_until}"
     
-    await message.answer(
+    # Get community stats
+    community = get_community_stats()
+    
+    base_stats = (
         "📊 <b>Статистика IceBox</b>\n\n"
         f"💾 Всего сохранено: {stats['total']}\n"
         f"✅ Живых идей: {stats['alive']}\n"
         f"🗑️ Удалено: {stats['deleted']}\n"
         f"⭐ Ценных: {stats['valuable']}\n\n"
         f"📉 Процент выживаемости: {int(stats['alive']/max(stats['total'],1)*100)}%"
-        f"{premium_status}",
-        parse_mode="HTML"
+        f"{premium_status}\n\n"
+        f"🌍 <b>Сегодня в IceBox:</b>\n"
+        f"💡 {community['ideas_today']} идей сохранено\n"
+        f"🌙 {community['night_ideas']} из них ночью"
     )
+    
+    # Add insights button for premium users
+    if user[2] == 1:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧠 Показать инсайты", callback_data="show_insights")]
+        ])
+        await message.answer(base_stats, parse_mode="HTML", reply_markup=kb)
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔒 Инсайты (Premium)", callback_data="need_premium")]
+        ])
+        await message.answer(base_stats, parse_mode="HTML", reply_markup=kb)
 
 @router.message(Command("echo"))
 async def cmd_echo(message: Message):
@@ -1000,6 +1236,12 @@ async def btn_dump(message: Message):
 async def btn_freeze(message: Message):
     await cmd_freeze(message)
 
+@router.callback_query(F.data == "show_referral")
+async def show_referral_callback(callback: CallbackQuery):
+    await callback.message.delete()
+    await cmd_referral(callback.message)
+    await callback.answer()
+
 @router.message(F.text == "📊 Статистика")
 async def btn_stats(message: Message):
     await cmd_stats(message)
@@ -1016,77 +1258,39 @@ async def btn_export(message: Message):
 async def btn_premium(message: Message):
     await cmd_premium(message)
 
-@router.message(Command("find"))
-async def cmd_find(message: Message):
-    query = message.text[6:].strip()
-    
-    if not query:
-        await message.answer(
-            "🔍 Введи слово или фразу для поиска:\n\n"
-            "Например: <code>/find концепция</code>",
-            parse_mode="HTML"
-        )
-        return
-    
+@router.message(F.text == "⏰ Капсула")
+async def btn_capsule(message: Message, state: FSMContext):
+    await cmd_capsule(message, state)
+
+@router.message(Command("capsule"))
+async def cmd_capsule(message: Message):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''SELECT id, content, created_at, is_valuable 
-                 FROM ideas 
-                 WHERE user_id = ? AND content LIKE ?
-                 ORDER BY created_at DESC LIMIT 20''',
-              (message.from_user.id, f"%{query}%"))
-    results = c.fetchall()
+    c.execute('''SELECT id, message, open_at, created_at 
+                 FROM time_capsules 
+                 WHERE user_id = ? AND is_opened = 0
+                 ORDER BY open_at ASC''',
+              (message.from_user.id,))
+    capsules = c.fetchall()
     conn.close()
-    
-    if not results:
-        await message.answer(f"❌ Ничего не найдено по запросу: <b>{query}</b>", parse_mode="HTML")
-        return
-    
-    await message.answer(f"🔍 Найдено: <b>{len(results)}</b>\n", parse_mode="HTML")
-    
-    for idea_id, content, created_at, is_valuable in results:
-        date_str = datetime.fromisoformat(created_at).strftime("%d.%m.%Y")
-        valuable_mark = "⭐ " if is_valuable else ""
-        
-        # Найти позицию запроса в тексте
-        query_lower = query.lower()
-        content_lower = content.lower()
-        pos = content_lower.find(query_lower)
-        
-        if pos != -1:
-            # Показать контекст: 40 символов до и после
-            context_start = max(0, pos - 40)
-            context_end = min(len(content), pos + len(query) + 40)
-            
-            before = content[context_start:pos]
-            match = content[pos:pos + len(query)]
-            after = content[context_end - (pos + len(query)):context_end]
-            
-            # Добавить многоточие если текст обрезан
-            if context_start > 0:
-                before = "..." + before
-            if context_end < len(content):
-                after = after + "..."
-            
-            preview = f"{before}<b>{match}</b>{after}"
-            
-            # Остальной текст под спойлер
-            full_text = ""
-            if len(content) > 100:
-                full_text = f"\n\n<tg-spoiler>{content}</tg-spoiler>"
-        else:
-            preview = content[:80] + ("..." if len(content) > 80 else "")
-            full_text = f"\n\n<tg-spoiler>{content}</tg-spoiler>" if len(content) > 80 else ""
-        
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👁️ Открыть", callback_data=f"open_{idea_id}")]
-        ])
-        
+
+    if not capsules:
         await message.answer(
-            f"{valuable_mark}📅 {date_str}\n{preview}{full_text}",
-            reply_markup=kb,
+            "⏰ <b>Капсула времени</b>\n\n"
+            "У тебя пока нет активных капсул времени.\n\n"
+            "Чтобы создать новую, используй /capsulecreate",
             parse_mode="HTML"
         )
+        return
+
+    text = "⏰ <b>Твои капсулы времени:</b>\n\n"
+    for cap_id, cap_message, open_at, created_at in capsules:
+        open_date = datetime.fromisoformat(open_at).strftime("%d.%m.%Y %H:%M")
+        created_date = datetime.fromisoformat(created_at).strftime("%d.%m.%Y")
+        text += f"📅 <b>{open_date}</b> (создана {created_date})\n"
+        text += f"💬 {cap_message[:50]}...\n\n"
+
+    await message.answer(text, parse_mode="HTML")
 
 @router.message(F.voice)
 async def handle_voice(message: Message):
@@ -1143,12 +1347,24 @@ async def handle_voice(message: Message):
     
     save_idea(message.from_user.id, content, "voice", message.voice.file_id, file_path, "direct", weather)
     
+    achievement = save_idea(message.from_user.id, content, "voice", message.voice.file_id, file_path, "direct", weather)
+    
     # Clean up file if not premium or no transcription
     if user[2] == 0 or not transcription:
         try:
             os.remove(file_path)
         except:
             pass
+    
+    if achievement == "achievement_100":
+        await message.answer(
+            "🎉 <b>Достижение разблокировано!</b>\n\n"
+            "💯 100 сохранённых идей!\n\n"
+            "🎁 Ты получил <b>7 дней Premium</b> в подарок!\n\n"
+            "Теперь тебе доступны все премиум-функции. Наслаждайся! 🚀",
+            parse_mode="HTML"
+        )
+        return
     
     await message.answer("🧊")
 
@@ -1214,6 +1430,19 @@ async def handle_photo(message: Message):
         return
     
     save_idea(message.from_user.id, caption, "photo", message.photo[-1].file_id, None, "direct", weather)
+    
+    achievement = save_idea(message.from_user.id, caption, "photo", message.photo[-1].file_id, None, "direct", weather)
+    
+    if achievement == "achievement_100":
+        await message.answer(
+            "🎉 <b>Достижение разблокировано!</b>\n\n"
+            "💯 100 сохранённых идей!\n\n"
+            "🎁 Ты получил <b>7 дней Premium</b> в подарок!\n\n"
+            "Теперь тебе доступны все премиум-функции. Наслаждайся! 🚀",
+            parse_mode="HTML"
+        )
+        return
+    
     await message.answer("🧊")
 
 @router.callback_query(F.data == "save_new_photo")
@@ -1510,6 +1739,20 @@ async def handle_text(message: Message, state: FSMContext):
         return
     
     save_idea(message.from_user.id, message.text, "text", None, None, "direct", weather)
+    
+    # Check for achievement
+    achievement = save_idea(message.from_user.id, message.text, "text", None, None, "direct", weather)
+    
+    if achievement == "achievement_100":
+        await message.answer(
+            "🎉 <b>Достижение разблокировано!</b>\n\n"
+            "💯 100 сохранённых идей!\n\n"
+            "🎁 Ты получил <b>7 дней Premium</b> в подарок!\n\n"
+            "Теперь тебе доступны все премиум-функции. Наслаждайся! 🚀",
+            parse_mode="HTML"
+        )
+        return
+    
     await message.answer("🧊")
 
 @router.callback_query(F.data == "save_new_text")
@@ -1531,9 +1774,54 @@ async def save_new_text(callback: CallbackQuery):
     await callback.answer()
 
 # ==================== MAIN ====================
+async def check_capsules():
+    """Background task to check and send time capsules"""
+    while True:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            
+            # Get ready capsules
+            c.execute("""SELECT id, user_id, message, created_at 
+                         FROM time_capsules 
+                         WHERE is_opened = 0 AND open_at <= datetime('now')""")
+            capsules = c.fetchall()
+            
+            for cap_id, user_id, message, created_at in capsules:
+                try:
+                    created_date = datetime.fromisoformat(created_at).strftime("%d.%m.%Y")
+                    days_ago = (datetime.now() - datetime.fromisoformat(created_at)).days
+                    
+                    await bot.send_message(
+                        user_id,
+                        f"⏰ <b>Капсула времени открыта!</b>\n\n"
+                        f"📅 Ты писал это {days_ago} дней назад ({created_date}):\n\n"
+                        f"💬 {message}\n\n"
+                        f"Как изменились твои мысли с тех пор? 🤔",
+                        parse_mode="HTML"
+                    )
+                    
+                    c.execute("UPDATE time_capsules SET is_opened = 1 WHERE id = ?", (cap_id,))
+                    conn.commit()
+                    
+                except Exception as e:
+                    logger.error(f"Error sending capsule: {e}")
+            
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f"Capsule check error: {e}")
+        
+        # Check every hour
+        await asyncio.sleep(3600)
+
 async def main():
     init_db()
     dp.include_router(router)
+    
+    # Start background task for capsules
+    asyncio.create_task(check_capsules())
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
